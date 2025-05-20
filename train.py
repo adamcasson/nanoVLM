@@ -157,25 +157,18 @@ def get_lr(it, max_lr, max_steps):
 
 
 def build_optimizers(model, train_cfg):
-    """Create optimizers splitting parameters by module and dimensionality."""
-    linear_param_ids = {
-        id(p)
-        for m in model.modules()
-        if isinstance(m, nn.Linear)
-        for p in m.parameters(recurse=False)
-    }
-
+    """Create optimizers splitting parameters by dimensionality."""
     mp_muon, mp_adam = [], []
     backbone_muon, backbone_adam = [], []
 
     for name, param in model.named_parameters():
         if name.startswith("MP."):
-            if param.ndim >= 2:
+            if param.ndim == 2:
                 mp_muon.append(param)
             else:
                 mp_adam.append(param)
         else:
-            if id(param) in linear_param_ids and not name.startswith("decoder.token_embedding") and not name.startswith("decoder.head"):
+            if param.ndim == 2 and "embed" not in name and "head" not in name:
                 backbone_muon.append(param)
             else:
                 backbone_adam.append(param)
