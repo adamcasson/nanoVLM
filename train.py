@@ -6,9 +6,11 @@ import numpy
 import random
 import argparse
 import torch.optim as optim
+import torch.nn as nn
 from dataclasses import asdict
 from datasets import load_dataset, concatenate_datasets
 from torch.utils.data import DataLoader
+from muon import Muon
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -153,6 +155,49 @@ def get_lr(it, max_lr, max_steps):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+
+def build_optimizers(model, train_cfg):
+    """Create optimizers splitting parameters by dimensionality."""
+    mp_muon, mp_adam = [], []
+    backbone_muon, backbone_adam = [], []
+
+    for name, param in model.named_parameters():
+        if name.startswith("MP."):
+            if param.ndim == 2:
+                mp_muon.append(param)
+            else:
+                mp_adam.append(param)
+        else:
+            if param.ndim == 2 and "embed" not in name and "head" not in name:
+                backbone_muon.append(param)
+            else:
+                backbone_adam.append(param)
+
+    optimizers = []
+    if backbone_muon:
+        opt = Muon(backbone_muon, lr=train_cfg.lr_backbones)
+        for g in opt.param_groups:
+            g["initial_lr"] = g["lr"]
+        optimizers.append(opt)
+    if mp_muon:
+        opt = Muon(mp_muon, lr=train_cfg.lr_mp)
+        for g in opt.param_groups:
+            g["initial_lr"] = g["lr"]
+        optimizers.append(opt)
+
+    adam_backbone = optim.AdamW([{"params": backbone_adam, "lr": train_cfg.lr_backbones}])
+    for g in adam_backbone.param_groups:
+        g["initial_lr"] = g["lr"]
+    optimizers.append(adam_backbone)
+
+    if mp_adam:
+        adam_mp = optim.AdamW([{"params": mp_adam, "lr": train_cfg.lr_mp}])
+        for g in adam_mp.param_groups:
+            g["initial_lr"] = g["lr"]
+        optimizers.append(adam_mp)
+
+    return optimizers
+
 def train(train_cfg, vlm_cfg):
     train_loader, val_loader, test_loader = get_dataloaders(train_cfg, vlm_cfg)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
@@ -181,12 +226,18 @@ def train(train_cfg, vlm_cfg):
     print(f"Training summary: {len(train_loader.dataset)} samples, {len(train_loader)} batches/epoch, batch size {train_cfg.batch_size}")
     print(f"Validation summary: {len(val_loader.dataset)} samples, {len(val_loader)} batches/epoch, batch size {train_cfg.batch_size}")
 
-    # Define optimizer groups
-    # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
-    # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-    param_groups = [{'params': model.MP.parameters(), 'lr': train_cfg.lr_mp},
-                    {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
-    optimizer = optim.AdamW(param_groups)
+    # Define optimizers
+    if train_cfg.use_muon:
+        optimizers = build_optimizers(model, train_cfg)
+    else:
+        param_groups = [
+            {'params': model.MP.parameters(), 'lr': train_cfg.lr_mp},
+            {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}
+        ]
+        optimizer = optim.AdamW(param_groups)
+        for g in optimizer.param_groups:
+            g['initial_lr'] = g['lr']
+        optimizers = [optimizer]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -209,7 +260,8 @@ def train(train_cfg, vlm_cfg):
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            optimizer.zero_grad()
+            for opt in optimizers:
+                opt.zero_grad()
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16): # Set to float16 if your hardware doesn't support bfloat16ß
                 _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
@@ -218,10 +270,18 @@ def train(train_cfg, vlm_cfg):
 
             adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs)
             adj_lr_backbones = get_lr(global_step, train_cfg.lr_backbones, len(train_loader) * train_cfg.epochs)
-            optimizer.param_groups[0]['lr'] = adj_lr_mp
-            optimizer.param_groups[1]['lr'] = adj_lr_backbones
 
-            optimizer.step()
+            for opt in optimizers:
+                for pg in opt.param_groups:
+                    base = pg["initial_lr"]
+                    pg["lr"] = adj_lr_mp if abs(base - train_cfg.lr_mp) < 1e-12 else adj_lr_backbones
+
+            for opt in optimizers:
+                if isinstance(opt, Muon):
+                    for pg in opt.param_groups:
+                        frac = min(global_step / 300, 1)
+                        pg["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+                opt.step()
 
             batch_loss = loss.item()
             total_train_loss += batch_loss
@@ -307,6 +367,7 @@ def main():
     parser.add_argument('--lr_backbones', type=float, help='Learning rate for the backbones')
     parser.add_argument('--vlm_checkpoint_path', type=str, help='Path to the VLM checkpoint for loading or saving')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    parser.add_argument('--use_muon', action='store_true', help='Use Muon optimizer for linear layers')
 
     args = parser.parse_args()
 
@@ -324,6 +385,8 @@ def main():
         train_cfg.resume_from_vlm_checkpoint = True
         # When resuming a full VLM, we don't need to load individual backbone weights from original sources
         vlm_cfg.vlm_load_backbone_weights = False
+    if args.use_muon:
+        train_cfg.use_muon = True
 
     print("--- VLM Config ---")
     print(vlm_cfg)
