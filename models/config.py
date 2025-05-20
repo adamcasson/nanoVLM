@@ -12,7 +12,7 @@ class VLMConfig:
     vit_n_blocks: int = 12
     vit_ln_eps: float = 1e-6
     vit_cls_flag: bool = False
-    vit_model_type: str = 'google/siglip-base-patch16-224'
+    vit_model_type: str = 'google/siglip2-base-patch16-224'
 
     lm_hidden_dim: int = 576
     lm_inter_dim: int = 1536
@@ -44,7 +44,7 @@ class TrainConfig:
     lr_backbones: float = 1e-4
     data_cutoff_idx: int = None
     val_ratio: float = 0.01
-    batch_size: int = 256
+    batch_size: int = 96
     mmstar_batch_size: int = 32
     eval_in_epochs: bool = True
     epochs: int = 5
