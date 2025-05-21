@@ -185,13 +185,13 @@ def build_optimizers(model, train_cfg):
             g["initial_lr"] = g["lr"]
         optimizers.append(opt)
 
-    adam_backbone = optim.AdamW([{"params": backbone_adam, "lr": train_cfg.lr_backbones}])
+    adam_backbone = optim.AdamW([{"params": backbone_adam, "lr": train_cfg.lr_backbones}], betas=(0.8, 0.999))
     for g in adam_backbone.param_groups:
         g["initial_lr"] = g["lr"]
     optimizers.append(adam_backbone)
 
     if mp_adam:
-        adam_mp = optim.AdamW([{"params": mp_adam, "lr": train_cfg.lr_mp}])
+        adam_mp = optim.AdamW([{"params": mp_adam, "lr": train_cfg.lr_mp}], betas=(0.8, 0.999))
         for g in adam_mp.param_groups:
             g["initial_lr"] = g["lr"]
         optimizers.append(adam_mp)
@@ -234,7 +234,7 @@ def train(train_cfg, vlm_cfg):
             {'params': model.MP.parameters(), 'lr': train_cfg.lr_mp},
             {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}
         ]
-        optimizer = optim.AdamW(param_groups)
+        optimizer = optim.AdamW(param_groups, betas=(0.8, 0.999))
         for g in optimizer.param_groups:
             g['initial_lr'] = g['lr']
         optimizers = [optimizer]
